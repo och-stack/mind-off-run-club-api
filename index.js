@@ -5,18 +5,20 @@ const { createClient } = require("@supabase/supabase-js");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const path = require("path");
+const multer = require("multer");
+const { randomUUID } = require("crypto");
 
 dotenv.config();
 
 const app = express();
 
-// Allow JSON body requests and requests from the frontend
+// Allow JSON requests and requests from the frontend.
 app.use(express.json());
 app.use(cors({
   origin: process.env.FRONTEND_URL || true,
 }));
 
-// Connect to the Supabase PostgreSQL database
+// Connect to the Supabase PostgreSQL database.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -24,13 +26,36 @@ const pool = new Pool({
   },
 });
 
-// Connect to Supabase Auth
+// Supabase Auth client.
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
 
-// Test the database connection
+// Server-only Storage client.
+// Never expose the service role key in the frontend.
+const supabaseStorage = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// Receive image files in memory before uploading them to Storage.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+    files: 1,
+  },
+  fileFilter: (req, file, callback) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return callback(new Error("Only image files are allowed."));
+    }
+
+    callback(null, true);
+  },
+});
+
+// Test the database connection.
 pool.query("SELECT NOW()", (error) => {
   if (error) {
     console.error("Database connection failed:", error.message);
@@ -39,24 +64,19 @@ pool.query("SELECT NOW()", (error) => {
   }
 });
 
-// API documentation
+// API documentation.
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
-// Health check
+// Health check.
 app.get("/health", (req, res) => {
-  res.json({ message: "Mind Off Run Club API is running" });
+  res.json({
+    message: "Mind Off Run Club API is running",
+  });
 });
 
-// Start server
-const PORT = process.env.PORT || 4000;
-
-app.listen(PORT, () => {
-  console.log(`Mind Off Run Club API running on port ${PORT}`);
-});
-
-// Signup
+// Signup.
 app.post("/signup", async (req, res) => {
   try {
     const { username, email, password } = req.body;
@@ -67,7 +87,6 @@ app.post("/signup", async (req, res) => {
       });
     }
 
-    // Create the account using Supabase Auth
     const { data, error } = await supabase.auth.signUp({
       email: email.trim(),
       password,
@@ -83,14 +102,12 @@ app.post("/signup", async (req, res) => {
       });
     }
 
-    // Stop if Supabase did not return a user
     if (!data.user) {
       return res.status(400).json({
         error: "Unable to create your account",
       });
     }
 
-    // Create the user's profile in the profiles table
     const result = await pool.query(
       `
             INSERT INTO public.mindoff_profiles
@@ -126,7 +143,7 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-// Login
+// Login.
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -137,11 +154,11 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // Verify the email and password using Supabase Auth
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email: email.trim(),
-      password,
-    });
+    const { data, error } =
+      await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
 
     if (error) {
       console.error("Supabase login error:", error.message);
@@ -151,7 +168,6 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // Get the user's profile from the profiles table
     const result = await pool.query(
       `
             SELECT id, username, email, bio, avatar_url, created_at
@@ -181,8 +197,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Authentication middleware
-// Verify the Supabase access token
+// Verify the Supabase access token.
 async function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
 
@@ -192,17 +207,15 @@ async function authenticateToken(req, res, next) {
     });
   }
 
-  // Get the token from "Bearer TOKEN"
-  const token = authHeader.split(" ")[1];
+  const [scheme, token] = authHeader.split(" ");
 
-  if (!token) {
+  if (scheme !== "Bearer" || !token) {
     return res.status(401).json({
       error: "Invalid authentication token",
     });
   }
 
   try {
-    // Ask Supabase Auth to verify the token
     const { data, error } = await supabase.auth.getUser(token);
 
     if (error || !data.user) {
@@ -211,7 +224,6 @@ async function authenticateToken(req, res, next) {
       });
     }
 
-    // Store the authenticated user's ID in the request
     req.user = {
       id: data.user.id,
       email: data.user.email,
@@ -227,7 +239,7 @@ async function authenticateToken(req, res, next) {
   }
 }
 
-// Get the logged-in user's profile
+// Get the logged-in user's profile.
 app.get("/profile", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -255,7 +267,7 @@ app.get("/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Update the logged-in user's profile
+// Update the logged-in user's profile.
 app.put("/profile", authenticateToken, async (req, res) => {
   try {
     const { username, bio, avatar_url } = req.body;
@@ -308,7 +320,7 @@ app.put("/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Get users except the logged-in user
+// Get users except the logged-in user.
 app.get("/users", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -355,7 +367,7 @@ app.get("/users", authenticateToken, async (req, res) => {
   }
 });
 
-// Send a friend request
+// Send a friend request.
 app.post("/friends", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -367,14 +379,12 @@ app.post("/friends", authenticateToken, async (req, res) => {
       });
     }
 
-    // Prevent users from sending requests to themselves
     if (userId === friend_id) {
       return res.status(400).json({
         error: "You cannot add yourself as a friend",
       });
     }
 
-    // Check whether the selected profile exists
     const friendResult = await pool.query(
       `
             SELECT id
@@ -390,7 +400,6 @@ app.post("/friends", authenticateToken, async (req, res) => {
       });
     }
 
-    // Check whether a request already exists in either direction
     const existingResult = await pool.query(
       `
             SELECT id, status
@@ -407,7 +416,6 @@ app.post("/friends", authenticateToken, async (req, res) => {
       });
     }
 
-    // Create a new pending friend request
     const result = await pool.query(
       `
             INSERT INTO public.mindoff_friendships
@@ -431,7 +439,7 @@ app.post("/friends", authenticateToken, async (req, res) => {
   }
 });
 
-// Get the logged-in user's friend requests and friendships
+// Get the logged-in user's friend requests and friendships.
 app.get("/friends", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -472,13 +480,12 @@ app.get("/friends", authenticateToken, async (req, res) => {
   }
 });
 
-// Accept a friend request
+// Accept a friend request.
 app.put("/friends/:id", authenticateToken, async (req, res) => {
   try {
     const friendshipId = req.params.id;
     const userId = req.user.id;
 
-    // Only the receiver can accept a pending request
     const result = await pool.query(
       `
             UPDATE public.mindoff_friendships
@@ -510,54 +517,104 @@ app.put("/friends/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Create a post
-app.post("/posts", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { title, content, image_url, visibility } = req.body;
+// Create a post with an optional image file.
+app.post(
+  "/posts",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    let imagePath = null;
+    let postCreated = false;
 
-    if (!content || !visibility) {
-      return res.status(400).json({
-        error: "Content and visibility are required",
+    try {
+      const userId = req.user.id;
+      const { title, content, visibility } = req.body;
+
+      if (!content || !content.trim()) {
+        return res.status(400).json({
+          error: "Content is required",
+        });
+      }
+
+      if (!["public", "friends"].includes(visibility)) {
+        return res.status(400).json({
+          error: "Visibility must be public or friends",
+        });
+      }
+
+      // Upload the selected file to Supabase Storage.
+      if (req.file) {
+        const extension = req.file.mimetype
+          .split("/")[1]
+          .replace(/[^a-zA-Z0-9]/g, "");
+
+        const fileName = `${randomUUID()}.${extension}`;
+        imagePath = `${userId}/${fileName}`;
+
+        const { error: uploadError } =
+          await supabaseStorage.storage
+            .from("post-images")
+            .upload(imagePath, req.file.buffer, {
+              contentType: req.file.mimetype,
+              upsert: false,
+            });
+
+        if (uploadError) {
+          throw uploadError;
+        }
+      }
+
+      // Save the storage path with the post.
+      const result = await pool.query(
+        `
+                INSERT INTO public.mindoff_posts
+                    (user_id, title, content, image_url, visibility)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *;
+                `,
+        [
+          userId,
+          title?.trim() || "",
+          content.trim(),
+          imagePath,
+          visibility,
+        ]
+      );
+
+      postCreated = true;
+
+      res.status(201).json({
+        message: "Post created successfully",
+        post: result.rows[0],
       });
+    } catch (error) {
+      console.error("Create post error:", error);
+
+      // Remove an uploaded image if saving the post failed.
+      if (imagePath && !postCreated) {
+        const { error: removeError } =
+          await supabaseStorage.storage
+            .from("post-images")
+            .remove([imagePath]);
+
+        if (removeError) {
+          console.error(
+            "Image cleanup error:",
+            removeError.message
+          );
+        }
+      }
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Failed to create post",
+        });
+      }
     }
-
-    if (!["public", "friends"].includes(visibility)) {
-      return res.status(400).json({
-        error: "Visibility must be public or friends",
-      });
-    }
-
-    const result = await pool.query(
-      `
-            INSERT INTO public.mindoff_posts
-                (user_id, title, content, image_url, visibility)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *;
-            `,
-      [
-        userId,
-        title ?? "",
-        content,
-        image_url ?? null,
-        visibility,
-      ]
-    );
-
-    res.status(201).json({
-      message: "Post created successfully",
-      post: result.rows[0],
-    });
-  } catch (error) {
-    console.error("Create post error:", error);
-
-    res.status(500).json({
-      error: "Failed to create post",
-    });
   }
-});
+);
 
-// Get public posts, own posts, and accepted friends' posts
+// Get public posts, own posts, and accepted friends' posts.
 app.get("/posts", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -603,7 +660,38 @@ app.get("/posts", authenticateToken, async (req, res) => {
       [userId]
     );
 
-    res.json(result.rows);
+    // Convert stored paths into temporary URLs for the feed.
+    const postsWithImages = await Promise.all(
+      result.rows.map(async (post) => {
+        if (!post.image_url) {
+          return post;
+        }
+
+        const { data, error } =
+          await supabaseStorage.storage
+            .from("post-images")
+            .createSignedUrl(post.image_url, 60 * 60);
+
+        if (error) {
+          console.error(
+            "Create signed URL error:",
+            error.message
+          );
+
+          return {
+            ...post,
+            image_url: null,
+          };
+        }
+
+        return {
+          ...post,
+          image_url: data.signedUrl,
+        };
+      })
+    );
+
+    res.json(postsWithImages);
   } catch (error) {
     console.error("Get posts error:", error);
 
@@ -613,18 +701,43 @@ app.get("/posts", authenticateToken, async (req, res) => {
   }
 });
 
-// Handle unknown routes
+// Handle unknown routes.
 app.use((req, res) => {
   res.status(404).json({
     error: "Route not found",
   });
 });
 
-// Handle unexpected errors
+// Handle upload and unexpected errors.
 app.use((error, req, res, next) => {
-  console.error("Unexpected API error:", error);
+  console.error("Unexpected API error:", error.message);
+
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        error: "Image must be 5 MB or smaller",
+      });
+    }
+
+    return res.status(400).json({
+      error: error.message,
+    });
+  }
+
+  if (error.message === "Only image files are allowed.") {
+    return res.status(400).json({
+      error: error.message,
+    });
+  }
 
   res.status(500).json({
     error: "Internal server error",
   });
+});
+
+// Start server after registering routes and middleware.
+const PORT = process.env.PORT || 4000;
+
+app.listen(PORT, () => {
+  console.log(`Mind Off Run Club API running on port ${PORT}`);
 });
