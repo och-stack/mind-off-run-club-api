@@ -117,12 +117,7 @@ app.post("/signup", async (req, res) => {
     const { username, email, password } = req.body;
 
     if (
-      typeof username !== "string" ||
-      typeof email !== "string" ||
-      typeof password !== "string" ||
-      !username.trim() ||
-      !email.trim() ||
-      password.length < 8
+      !username || !email || !password
     ) {
       return res.status(400).json({
         error: "Username, email, and a password of at least 8 characters are required",
