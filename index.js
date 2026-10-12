@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -9,7 +8,32 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Check required environment variables before connecting.
+// Connect the React frontend to this API.
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:5173",
+}));
+
+app.use(express.json());
+
+// Connect to the Supabase PostgreSQL database.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Supabase client for signup, login, and token verification.
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  }
+);
+
+// Check required environment variables before starting.
 const requiredEnv = [
   "SUPABASE_URL",
   "SUPABASE_ANON_KEY",
@@ -21,33 +45,6 @@ for (const name of requiredEnv) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
 }
-
-// Connect the React frontend to this API.
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:5173",
-  })
-);
-
-app.use(express.json());
-
-// Connect to the Supabase PostgreSQL database.
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-// Use Supabase Auth for signup, login, and token verification.
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  }
-);
 
 // Verify the Supabase access token sent by the logged-in user.
 async function authenticateToken(req, res, next) {
@@ -70,7 +67,7 @@ async function authenticateToken(req, res, next) {
       });
     }
 
-    // Use the Supabase Auth UUID to identify the user.
+    // Use the Supabase Auth UUID to identify this user.
     req.user = {
       id: data.user.id,
       email: data.user.email,
@@ -86,7 +83,7 @@ async function authenticateToken(req, res, next) {
   }
 }
 
-// Check whether the API and database are running.
+// Basic API and database health checks.
 app.get("/", (req, res) => {
   res.send("Mind Off Run Club API is running!");
 });
@@ -113,30 +110,22 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// Create an account with Supabase Auth and save its profile with SQL.
+// Create a Supabase Auth account.
+// The database trigger creates the matching profile.
+// Signup
 app.post("/signup", async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
-    if (
-      typeof username !== "string" ||
-      typeof email !== "string" ||
-      typeof password !== "string" ||
-      !username.trim() ||
-      !email.trim() ||
-      !password
-    ) {
+    if (!username || !email || !password) {
       return res.status(400).json({
         error: "Username, email and password are required",
       });
     }
 
-    const cleanUsername = username.trim();
-    const cleanEmail = email.trim();
-
-    // Create the authentication account with Supabase.
+    // Create the account with Supabase Auth
     const { data, error } = await supabase.auth.signUp({
-      email: cleanEmail,
+      email,
       password,
     });
 
@@ -146,42 +135,41 @@ app.post("/signup", async (req, res) => {
       });
     }
 
-    if (!data.user) {
-      return res.status(400).json({
-        error: "Unable to create authentication account",
+    // Create the user's profile
+    const { error: profileError } = await supabase
+      .from("mindoff_profiles")
+      .insert({
+        id: data.user.id,
+        username,
+        email,
+      });
+
+    if (profileError) {
+      console.log(profileError);
+
+      return res.status(500).json({
+        error: "Account created, but failed to create profile",
       });
     }
-
-    // Save the user's profile using a PostgreSQL query.
-    const result = await pool.query(
-      `INSERT INTO public.mindoff_profiles
-                (id, username, email)
-             VALUES ($1, $2, $3)
-             RETURNING id, username, email, bio, avatar_url, created_at`,
-      [data.user.id, cleanUsername, cleanEmail]
-    );
 
     res.status(201).json({
       message: "User created successfully",
-      user: result.rows[0],
-      needsEmailConfirmation: !data.session,
+      user: {
+        id: data.user.id,
+        username,
+        email,
+      },
     });
   } catch (error) {
-    console.error("Signup failed:", error.message);
-
-    if (error.code === "23505") {
-      return res.status(409).json({
-        error: "Username or email already exists",
-      });
-    }
+    console.log(error);
 
     res.status(500).json({
-      error: "Failed to create user or profile",
+      error: "Failed to create user",
     });
   }
 });
 
-// Log in with Supabase Auth and return an access token.
+// Log in and receive a Supabase access token.
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -220,9 +208,7 @@ app.post("/login", async (req, res) => {
   } catch (error) {
     console.error("Login failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to log in",
-    });
+    res.status(500).json({ error: "Unable to log in" });
   }
 });
 
@@ -246,9 +232,7 @@ app.get("/profile", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Profile lookup failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to load profile",
-    });
+    res.status(500).json({ error: "Unable to load profile" });
   }
 });
 
@@ -316,9 +300,7 @@ app.put("/profile", authenticateToken, async (req, res) => {
 
     console.error("Profile update failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to update profile",
-    });
+    res.status(500).json({ error: "Unable to update profile" });
   }
 });
 
@@ -354,9 +336,7 @@ app.get("/users", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("User list failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to load users",
-    });
+    res.status(500).json({ error: "Unable to load users" });
   }
 });
 
@@ -375,9 +355,7 @@ app.post("/friends", authenticateToken, async (req, res) => {
     }
 
     const target = await pool.query(
-      `SELECT id
-             FROM public.mindoff_profiles
-             WHERE id = $1`,
+      `SELECT id FROM public.mindoff_profiles WHERE id = $1`,
       [friend_id]
     );
 
@@ -429,7 +407,7 @@ app.post("/friends", authenticateToken, async (req, res) => {
   }
 });
 
-// List incoming requests, outgoing requests, and accepted friendships.
+// List incoming requests and accepted friendships.
 app.get("/friends", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -453,7 +431,7 @@ app.get("/friends", authenticateToken, async (req, res) => {
                     WHEN f.requester_id = $1 THEN f.receiver_id
                     ELSE f.requester_id
                 END
-             WHERE f.requester_id = $1 OR f.receiver_id = $1
+             WHERE (f.requester_id = $1 OR f.receiver_id = $1)
              ORDER BY f.created_at DESC`,
       [req.user.id]
     );
@@ -462,9 +440,7 @@ app.get("/friends", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Friend list failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to load friends",
-    });
+    res.status(500).json({ error: "Unable to load friends" });
   }
 });
 
@@ -473,10 +449,7 @@ app.put("/friends/:id", authenticateToken, async (req, res) => {
   try {
     const friendshipId = Number(req.params.id);
 
-    if (
-      !Number.isSafeInteger(friendshipId) ||
-      friendshipId <= 0
-    ) {
+    if (!Number.isSafeInteger(friendshipId) || friendshipId <= 0) {
       return res.status(400).json({
         error: "Invalid friend request ID",
       });
@@ -514,12 +487,7 @@ app.put("/friends/:id", authenticateToken, async (req, res) => {
 // Create a running post.
 app.post("/posts", authenticateToken, async (req, res) => {
   try {
-    const {
-      title,
-      content,
-      image_url,
-      visibility = "public",
-    } = req.body;
+    const { title, content, image_url, visibility = "public" } = req.body;
 
     if (
       typeof title !== "string" ||
@@ -569,13 +537,11 @@ app.post("/posts", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Post creation failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to create post",
-    });
+    res.status(500).json({ error: "Unable to create post" });
   }
 });
 
-// Get public posts, your own posts, and accepted friends' private posts.
+// Get public posts, your own posts, and accepted friends' friends-only posts.
 app.get("/posts", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -615,44 +581,31 @@ app.get("/posts", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("Feed lookup failed:", error.message);
 
-    res.status(500).json({
-      error: "Unable to load posts",
-    });
+    res.status(500).json({ error: "Unable to load posts" });
   }
 });
 
-// Return a consistent response for unknown API routes.
+// Handle unknown API routes.
 app.use((req, res) => {
-  res.status(404).json({
-    error: "Route not found",
-  });
+  res.status(404).json({ error: "Route not found" });
 });
 
-// Handle unexpected errors without exposing private details.
+// Handle unexpected errors without returning private details.
 app.use((error, req, res, next) => {
   console.error("Unexpected API error:", error.message);
 
-  res.status(500).json({
-    error: "Internal server error",
-  });
+  res.status(500).json({ error: "Internal server error" });
 });
 
-// Start the API server.
 const server = app.listen(PORT, () => {
   console.log(`Mind Off Run Club API running on port ${PORT}`);
 });
 
-// Close the server and database connection when stopping the API.
+// Close database connections cleanly when stopping the server.
 async function shutdown() {
-  server.close(async () => {
-    try {
-      await pool.end();
-      process.exit(0);
-    } catch (error) {
-      console.error("Shutdown failed:", error.message);
-      process.exit(1);
-    }
-  });
+  server.close();
+  await pool.end();
+  process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
