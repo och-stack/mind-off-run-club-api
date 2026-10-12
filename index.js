@@ -1,117 +1,61 @@
-require("dotenv").config();
 
 const express = require("express");
-const cors = require("cors");
 const { Pool } = require("pg");
 const { createClient } = require("@supabase/supabase-js");
+const dotenv = require("dotenv");
+const cors = require("cors");
+const path = require("path");
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 4000;
 
-// Connect the React frontend to this API.
+// Allow JSON body requests and requests from the frontend
+app.use(express.json());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:5173",
+  origin: process.env.FRONTEND_URL || true,
 }));
 
-app.use(express.json());
-
-// Connect to the Supabase PostgreSQL database.
+// Connect to the Supabase PostgreSQL database
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
-// Supabase client for signup, login, and token verification.
+// Connect to Supabase Auth
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  }
+  process.env.SUPABASE_ANON_KEY
 );
 
-// Check required environment variables before starting.
-const requiredEnv = [
-  "SUPABASE_URL",
-  "SUPABASE_ANON_KEY",
-  "DATABASE_URL",
-];
-
-for (const name of requiredEnv) {
-  if (!process.env[name]) {
-    throw new Error(`Missing required environment variable: ${name}`);
+// Test the database connection
+pool.query("SELECT NOW()", (error) => {
+  if (error) {
+    console.error("Database connection failed:", error.message);
+  } else {
+    console.log("Database connected");
   }
-}
+});
 
-// Verify the Supabase access token sent by the logged-in user.
-async function authenticateToken(req, res, next) {
-  const authorization = req.headers.authorization;
-
-  if (!authorization || !authorization.startsWith("Bearer ")) {
-    return res.status(401).json({
-      error: "Authentication token is required",
-    });
-  }
-
-  const token = authorization.split(" ")[1];
-
-  try {
-    const { data, error } = await supabase.auth.getUser(token);
-
-    if (error || !data.user) {
-      return res.status(401).json({
-        error: "Invalid or expired token",
-      });
-    }
-
-    // Use the Supabase Auth UUID to identify this user.
-    req.user = {
-      id: data.user.id,
-      email: data.user.email,
-    };
-
-    next();
-  } catch (error) {
-    console.error("Token verification failed:", error.message);
-
-    return res.status(401).json({
-      error: "Unable to verify token",
-    });
-  }
-}
-
-// Basic API and database health checks.
+// API documentation
 app.get("/", (req, res) => {
-  res.send("Mind Off Run Club API is running!");
+  res.sendFile(path.join(__dirname, "index.html"));
 });
 
-app.get("/health", async (req, res) => {
-  try {
-    const result = await pool.query(`
-            SELECT
-                (SELECT COUNT(*) FROM public.mindoff_profiles) AS profiles,
-                (SELECT COUNT(*) FROM public.mindoff_posts) AS posts,
-                (SELECT COUNT(*) FROM public.mindoff_friendships) AS friendships
-        `);
-
-    res.json({
-      message: "Database connected",
-      counts: result.rows[0],
-    });
-  } catch (error) {
-    console.error("Health check failed:", error.message);
-
-    res.status(500).json({
-      error: "Database connection failed",
-    });
-  }
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ message: "Mind Off Run Club API is running" });
 });
 
-// Create a Supabase Auth account.
-// The database trigger creates the matching profile.
+// Start server
+const PORT = process.env.PORT || 4000;
+
+app.listen(PORT, () => {
+  console.log(`Mind Off Run Club API running on port ${PORT}`);
+});
+
 // Signup
 app.post("/signup", async (req, res) => {
   try {
@@ -123,102 +67,175 @@ app.post("/signup", async (req, res) => {
       });
     }
 
-    // Create the account with Supabase Auth
+    // Create the account using Supabase Auth
     const { data, error } = await supabase.auth.signUp({
-      email,
+      email: email.trim(),
       password,
     });
 
     if (error) {
+      console.error("Supabase signup error:", error);
+
       return res.status(400).json({
         error: error.message,
+        code: error.code,
+        status: error.status,
       });
     }
 
-    // Create the user's profile
-    const { error: profileError } = await supabase
-      .from("mindoff_profiles")
-      .insert({
-        id: data.user.id,
-        username,
-        email,
-      });
-
-    if (profileError) {
-      console.log(profileError);
-
-      return res.status(500).json({
-        error: "Account created, but failed to create profile",
+    // Stop if Supabase did not return a user
+    if (!data.user) {
+      return res.status(400).json({
+        error: "Unable to create your account",
       });
     }
+
+    // Create the user's profile in the profiles table
+    const result = await pool.query(
+      `
+            INSERT INTO public.mindoff_profiles
+                (id, username, email)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (id)
+            DO UPDATE SET email = EXCLUDED.email
+            RETURNING id, username, email, bio, avatar_url, created_at;
+            `,
+      [data.user.id, username.trim(), email.trim()]
+    );
 
     res.status(201).json({
-      message: "User created successfully",
-      user: {
-        id: data.user.id,
-        username,
-        email,
-      },
+      message: data.session
+        ? "Account created successfully"
+        : "Account created. Please confirm your email before logging in.",
+      user: result.rows[0],
+      access_token: data.session?.access_token || null,
+      needsEmailConfirmation: !data.session,
     });
   } catch (error) {
-    console.log(error);
+    console.error("Signup error:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "Username already exists",
+      });
+    }
 
     res.status(500).json({
-      error: "Failed to create user",
+      error: "Failed to create account",
     });
   }
 });
 
-// Log in and receive a Supabase access token.
+// Login
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (
-      typeof email !== "string" ||
-      typeof password !== "string" ||
-      !email.trim() ||
-      !password
-    ) {
+    if (!email || !password) {
       return res.status(400).json({
         error: "Email and password are required",
       });
     }
 
-    const { data, error } =
-      await supabase.auth.signInWithPassword({
-        email: email.trim(),
-        password,
-      });
+    // Verify the email and password using Supabase Auth
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    });
 
-    if (error || !data.session) {
+    if (error) {
+      console.error("Supabase login error:", error.message);
+
       return res.status(401).json({
-        error: "Invalid email or password, or email confirmation is required",
+        error: "Invalid email or password",
+      });
+    }
+
+    // Get the user's profile from the profiles table
+    const result = await pool.query(
+      `
+            SELECT id, username, email, bio, avatar_url, created_at
+            FROM public.mindoff_profiles
+            WHERE id = $1;
+            `,
+      [data.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: "User profile not found",
       });
     }
 
     res.json({
       message: "Login successful",
       access_token: data.session.access_token,
-      user: {
-        id: data.user.id,
-        email: data.user.email,
-      },
+      user: result.rows[0],
     });
   } catch (error) {
-    console.error("Login failed:", error.message);
+    console.error("Login error:", error);
 
-    res.status(500).json({ error: "Unable to log in" });
+    res.status(500).json({
+      error: "Failed to login",
+    });
   }
 });
 
-// Get the logged-in user's profile.
+// Authentication middleware
+// Verify the Supabase access token
+async function authenticateToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({
+      error: "Authentication token is required",
+    });
+  }
+
+  // Get the token from "Bearer TOKEN"
+  const token = authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({
+      error: "Invalid authentication token",
+    });
+  }
+
+  try {
+    // Ask Supabase Auth to verify the token
+    const { data, error } = await supabase.auth.getUser(token);
+
+    if (error || !data.user) {
+      return res.status(401).json({
+        error: "Invalid or expired authentication token",
+      });
+    }
+
+    // Store the authenticated user's ID in the request
+    req.user = {
+      id: data.user.id,
+      email: data.user.email,
+    };
+
+    next();
+  } catch (error) {
+    console.error("Token verification error:", error.message);
+
+    res.status(401).json({
+      error: "Unable to verify authentication token",
+    });
+  }
+}
+
+// Get the logged-in user's profile
 app.get("/profile", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, email, bio, avatar_url, created_at
-             FROM public.mindoff_profiles
-             WHERE id = $1`,
+      `
+            SELECT id, username, email, bio, avatar_url, created_at
+            FROM public.mindoff_profiles
+            WHERE id = $1;
+            `,
       [req.user.id]
     );
 
@@ -230,53 +247,38 @@ app.get("/profile", authenticateToken, async (req, res) => {
 
     res.json(result.rows[0]);
   } catch (error) {
-    console.error("Profile lookup failed:", error.message);
+    console.error("Get profile error:", error);
 
-    res.status(500).json({ error: "Unable to load profile" });
+    res.status(500).json({
+      error: "Failed to get profile",
+    });
   }
 });
 
-// Update the logged-in user's profile.
+// Update the logged-in user's profile
 app.put("/profile", authenticateToken, async (req, res) => {
   try {
     const { username, bio, avatar_url } = req.body;
 
-    if (
-      username !== undefined &&
-      (typeof username !== "string" || !username.trim())
-    ) {
+    if (!username || !username.trim()) {
       return res.status(400).json({
-        error: "Username must not be empty",
-      });
-    }
-
-    if (bio !== undefined && typeof bio !== "string") {
-      return res.status(400).json({
-        error: "Bio must be text",
-      });
-    }
-
-    if (
-      avatar_url !== undefined &&
-      avatar_url !== null &&
-      typeof avatar_url !== "string"
-    ) {
-      return res.status(400).json({
-        error: "Avatar URL must be text or null",
+        error: "Username is required",
       });
     }
 
     const result = await pool.query(
-      `UPDATE public.mindoff_profiles
-             SET username = COALESCE($1, username),
-                 bio = COALESCE($2, bio),
-                 avatar_url = COALESCE($3, avatar_url)
-             WHERE id = $4
-             RETURNING id, username, email, bio, avatar_url, created_at`,
+      `
+            UPDATE public.mindoff_profiles
+            SET username = $1,
+                bio = $2,
+                avatar_url = $3
+            WHERE id = $4
+            RETURNING id, username, email, bio, avatar_url, created_at;
+            `,
       [
-        username === undefined ? null : username.trim(),
-        bio === undefined ? null : bio,
-        avatar_url === undefined ? null : avatar_url,
+        username.trim(),
+        bio ?? "",
+        avatar_url ?? null,
         req.user.id,
       ]
     );
@@ -288,104 +290,132 @@ app.put("/profile", authenticateToken, async (req, res) => {
     }
 
     res.json({
-      message: "Profile updated",
-      profile: result.rows[0],
+      message: "Profile updated successfully",
+      user: result.rows[0],
     });
   } catch (error) {
+    console.error("Update profile error:", error);
+
     if (error.code === "23505") {
       return res.status(409).json({
-        error: "That username is already taken",
+        error: "Username already exists",
       });
     }
 
-    console.error("Profile update failed:", error.message);
-
-    res.status(500).json({ error: "Unable to update profile" });
+    res.status(500).json({
+      error: "Failed to update profile",
+    });
   }
 });
 
-// List other users and their relationship with the logged-in user.
+// Get users except the logged-in user
 app.get("/users", authenticateToken, async (req, res) => {
   try {
+    const userId = req.user.id;
+
     const result = await pool.query(
-      `SELECT
+      `
+            SELECT
                 p.id,
                 p.username,
+                p.email,
                 p.bio,
                 p.avatar_url,
+                p.created_at,
                 f.id AS friendship_id,
                 f.status AS friendship_status,
                 CASE
                     WHEN f.requester_id = $1 THEN 'outgoing'
                     WHEN f.receiver_id = $1 THEN 'incoming'
                     ELSE NULL
-                END AS request_direction
-             FROM public.mindoff_profiles p
-             LEFT JOIN public.mindoff_friendships f
+                END AS friendship_direction
+            FROM public.mindoff_profiles p
+            LEFT JOIN public.mindoff_friendships f
                 ON (
-                    (f.requester_id = $1 AND f.receiver_id = p.id)
-                    OR
-                    (f.requester_id = p.id AND f.receiver_id = $1)
+                    f.requester_id = $1
+                    AND f.receiver_id = p.id
                 )
-             WHERE p.id <> $1
-             ORDER BY p.username`,
-      [req.user.id]
+                OR (
+                    f.requester_id = p.id
+                    AND f.receiver_id = $1
+                )
+            WHERE p.id <> $1
+            ORDER BY p.username;
+            `,
+      [userId]
     );
 
     res.json(result.rows);
   } catch (error) {
-    console.error("User list failed:", error.message);
+    console.error("Get users error:", error);
 
-    res.status(500).json({ error: "Unable to load users" });
+    res.status(500).json({
+      error: "Failed to get users",
+    });
   }
 });
 
-// Send a friend request.
+// Send a friend request
 app.post("/friends", authenticateToken, async (req, res) => {
   try {
+    const userId = req.user.id;
     const { friend_id } = req.body;
 
-    if (
-      typeof friend_id !== "string" ||
-      friend_id === req.user.id
-    ) {
+    if (!friend_id) {
       return res.status(400).json({
-        error: "A valid, different user's UUID is required",
+        error: "Friend ID is required",
       });
     }
 
-    const target = await pool.query(
-      `SELECT id FROM public.mindoff_profiles WHERE id = $1`,
+    // Prevent users from sending requests to themselves
+    if (userId === friend_id) {
+      return res.status(400).json({
+        error: "You cannot add yourself as a friend",
+      });
+    }
+
+    // Check whether the selected profile exists
+    const friendResult = await pool.query(
+      `
+            SELECT id
+            FROM public.mindoff_profiles
+            WHERE id = $1;
+            `,
       [friend_id]
     );
 
-    if (target.rows.length === 0) {
+    if (friendResult.rows.length === 0) {
       return res.status(404).json({
         error: "User not found",
       });
     }
 
-    const existing = await pool.query(
-      `SELECT id, status
-             FROM public.mindoff_friendships
-             WHERE (requester_id = $1 AND receiver_id = $2)
-                OR (requester_id = $2 AND receiver_id = $1)`,
-      [req.user.id, friend_id]
+    // Check whether a request already exists in either direction
+    const existingResult = await pool.query(
+      `
+            SELECT id, status
+            FROM public.mindoff_friendships
+            WHERE (requester_id = $1 AND receiver_id = $2)
+               OR (requester_id = $2 AND receiver_id = $1);
+            `,
+      [userId, friend_id]
     );
 
-    if (existing.rows.length > 0) {
+    if (existingResult.rows.length > 0) {
       return res.status(409).json({
         error: "A friend request or friendship already exists",
-        friendship: existing.rows[0],
       });
     }
 
+    // Create a new pending friend request
     const result = await pool.query(
-      `INSERT INTO public.mindoff_friendships
+      `
+            INSERT INTO public.mindoff_friendships
                 (requester_id, receiver_id, status)
-             VALUES ($1, $2, 'pending')
-             RETURNING *`,
-      [req.user.id, friend_id]
+            VALUES ($1, $2, 'pending')
+            RETURNING *;
+            `,
+      [userId, friend_id]
     );
 
     res.status(201).json({
@@ -393,76 +423,72 @@ app.post("/friends", authenticateToken, async (req, res) => {
       friendship: result.rows[0],
     });
   } catch (error) {
-    if (error.code === "23505") {
-      return res.status(409).json({
-        error: "A friend request or friendship already exists",
-      });
-    }
-
-    console.error("Friend request failed:", error.message);
+    console.error("Send friend request error:", error);
 
     res.status(500).json({
-      error: "Unable to send friend request",
+      error: "Failed to send friend request",
     });
   }
 });
 
-// List incoming requests and accepted friendships.
+// Get the logged-in user's friend requests and friendships
 app.get("/friends", authenticateToken, async (req, res) => {
   try {
+    const userId = req.user.id;
+
     const result = await pool.query(
-      `SELECT
+      `
+            SELECT
                 f.id AS friendship_id,
-                f.status,
                 f.requester_id,
                 f.receiver_id,
+                f.status,
                 f.created_at,
-                p.id AS user_id,
-                p.username,
-                p.bio,
-                p.avatar_url,
+                requester.username AS requester_username,
+                receiver.username AS receiver_username,
                 CASE
                     WHEN f.requester_id = $1 THEN 'outgoing'
                     ELSE 'incoming'
-                END AS request_direction
-             FROM public.mindoff_friendships f
-             JOIN public.mindoff_profiles p
-                ON p.id = CASE
-                    WHEN f.requester_id = $1 THEN f.receiver_id
-                    ELSE f.requester_id
-                END
-             WHERE (f.requester_id = $1 OR f.receiver_id = $1)
-             ORDER BY f.created_at DESC`,
-      [req.user.id]
+                END AS friendship_direction
+            FROM public.mindoff_friendships f
+            JOIN public.mindoff_profiles requester
+                ON requester.id = f.requester_id
+            JOIN public.mindoff_profiles receiver
+                ON receiver.id = f.receiver_id
+            WHERE f.requester_id = $1
+               OR f.receiver_id = $1
+            ORDER BY f.created_at DESC;
+            `,
+      [userId]
     );
 
     res.json(result.rows);
   } catch (error) {
-    console.error("Friend list failed:", error.message);
+    console.error("Get friendships error:", error);
 
-    res.status(500).json({ error: "Unable to load friends" });
+    res.status(500).json({
+      error: "Failed to get friendships",
+    });
   }
 });
 
-// Accept an incoming pending friend request.
+// Accept a friend request
 app.put("/friends/:id", authenticateToken, async (req, res) => {
   try {
-    const friendshipId = Number(req.params.id);
+    const friendshipId = req.params.id;
+    const userId = req.user.id;
 
-    if (!Number.isSafeInteger(friendshipId) || friendshipId <= 0) {
-      return res.status(400).json({
-        error: "Invalid friend request ID",
-      });
-    }
-
+    // Only the receiver can accept a pending request
     const result = await pool.query(
-      `UPDATE public.mindoff_friendships
-             SET status = 'accepted', updated_at = NOW()
-             WHERE id = $1
-               AND receiver_id = $2
-               AND status = 'pending'
-             RETURNING *`,
-      [friendshipId, req.user.id]
+      `
+            UPDATE public.mindoff_friendships
+            SET status = 'accepted'
+            WHERE id = $1
+              AND receiver_id = $2
+              AND status = 'pending'
+            RETURNING *;
+            `,
+      [friendshipId, userId]
     );
 
     if (result.rows.length === 0) {
@@ -476,27 +502,23 @@ app.put("/friends/:id", authenticateToken, async (req, res) => {
       friendship: result.rows[0],
     });
   } catch (error) {
-    console.error("Accept request failed:", error.message);
+    console.error("Accept friend request error:", error);
 
     res.status(500).json({
-      error: "Unable to accept friend request",
+      error: "Failed to accept friend request",
     });
   }
 });
 
-// Create a running post.
+// Create a post
 app.post("/posts", authenticateToken, async (req, res) => {
   try {
-    const { title, content, image_url, visibility = "public" } = req.body;
+    const userId = req.user.id;
+    const { title, content, image_url, visibility } = req.body;
 
-    if (
-      typeof title !== "string" ||
-      typeof content !== "string" ||
-      !title.trim() ||
-      !content.trim()
-    ) {
+    if (!content || !visibility) {
       return res.status(400).json({
-        error: "Title and content are required",
+        error: "Content and visibility are required",
       });
     }
 
@@ -506,46 +528,43 @@ app.post("/posts", authenticateToken, async (req, res) => {
       });
     }
 
-    if (
-      image_url !== undefined &&
-      image_url !== null &&
-      typeof image_url !== "string"
-    ) {
-      return res.status(400).json({
-        error: "Image URL must be text or null",
-      });
-    }
-
     const result = await pool.query(
-      `INSERT INTO public.mindoff_posts
+      `
+            INSERT INTO public.mindoff_posts
                 (user_id, title, content, image_url, visibility)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING *`,
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *;
+            `,
       [
-        req.user.id,
-        title.trim(),
-        content.trim(),
-        image_url || null,
+        userId,
+        title ?? "",
+        content,
+        image_url ?? null,
         visibility,
       ]
     );
 
     res.status(201).json({
-      message: "Post created",
+      message: "Post created successfully",
       post: result.rows[0],
     });
   } catch (error) {
-    console.error("Post creation failed:", error.message);
+    console.error("Create post error:", error);
 
-    res.status(500).json({ error: "Unable to create post" });
+    res.status(500).json({
+      error: "Failed to create post",
+    });
   }
 });
 
-// Get public posts, your own posts, and accepted friends' friends-only posts.
+// Get public posts, own posts, and accepted friends' posts
 app.get("/posts", authenticateToken, async (req, res) => {
   try {
+    const userId = req.user.id;
+
     const result = await pool.query(
-      `SELECT
+      `
+            SELECT
                 p.id,
                 p.user_id,
                 p.title,
@@ -553,11 +572,12 @@ app.get("/posts", authenticateToken, async (req, res) => {
                 p.image_url,
                 p.visibility,
                 p.created_at,
-                u.username,
-                u.avatar_url
-             FROM public.mindoff_posts p
-             JOIN public.mindoff_profiles u ON u.id = p.user_id
-             WHERE
+                profile.username,
+                profile.avatar_url
+            FROM public.mindoff_posts p
+            JOIN public.mindoff_profiles profile
+                ON profile.id = p.user_id
+            WHERE
                 p.visibility = 'public'
                 OR p.user_id = $1
                 OR (
@@ -567,46 +587,44 @@ app.get("/posts", authenticateToken, async (req, res) => {
                         FROM public.mindoff_friendships f
                         WHERE f.status = 'accepted'
                           AND (
-                            (f.requester_id = $1 AND f.receiver_id = p.user_id)
-                            OR
-                            (f.requester_id = p.user_id AND f.receiver_id = $1)
+                              (
+                                  f.requester_id = $1
+                                  AND f.receiver_id = p.user_id
+                              )
+                              OR (
+                                  f.requester_id = p.user_id
+                                  AND f.receiver_id = $1
+                              )
                           )
                     )
                 )
-             ORDER BY p.created_at DESC`,
-      [req.user.id]
+            ORDER BY p.created_at DESC;
+            `,
+      [userId]
     );
 
     res.json(result.rows);
   } catch (error) {
-    console.error("Feed lookup failed:", error.message);
+    console.error("Get posts error:", error);
 
-    res.status(500).json({ error: "Unable to load posts" });
+    res.status(500).json({
+      error: "Failed to get posts",
+    });
   }
 });
 
-// Handle unknown API routes.
+// Handle unknown routes
 app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
+  res.status(404).json({
+    error: "Route not found",
+  });
 });
 
-// Handle unexpected errors without returning private details.
+// Handle unexpected errors
 app.use((error, req, res, next) => {
-  console.error("Unexpected API error:", error.message);
+  console.error("Unexpected API error:", error);
 
-  res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({
+    error: "Internal server error",
+  });
 });
-
-const server = app.listen(PORT, () => {
-  console.log(`Mind Off Run Club API running on port ${PORT}`);
-});
-
-// Close database connections cleanly when stopping the server.
-async function shutdown() {
-  server.close();
-  await pool.end();
-  process.exit(0);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
