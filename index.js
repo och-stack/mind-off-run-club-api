@@ -112,48 +112,60 @@ app.get("/health", async (req, res) => {
 
 // Create a Supabase Auth account.
 // The database trigger creates the matching profile.
+// Signup
 app.post("/signup", async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
-    if (
-      !username || !email || !password
-    ) {
+    if (!username || !email || !password) {
       return res.status(400).json({
-        error: "Username, email, and a password of at least 8 characters are required",
+        error: "Username, email and password are required",
       });
     }
 
+    // Create the account with Supabase Auth
     const { data, error } = await supabase.auth.signUp({
-      email: email.trim(),
+      email,
       password,
-      options: {
-        data: {
-          username: username.trim(),
-        },
-      },
     });
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({
+        error: error.message,
+      });
+    }
+
+    // Create the user's profile
+    const { error: profileError } = await supabase
+      .from("mindoff_profiles")
+      .insert({
+        id: data.user.id,
+        username,
+        email,
+      });
+
+    if (profileError) {
+      console.log(profileError);
+
+      return res.status(500).json({
+        error: "Account created, but failed to create profile",
+      });
     }
 
     res.status(201).json({
-      message: data.session
-        ? "Account created successfully"
-        : "Account created. Check your email if confirmation is required.",
-      user: data.user
-        ? {
-          id: data.user.id,
-          email: data.user.email,
-        }
-        : null,
-      access_token: data.session?.access_token || null,
+      message: "User created successfully",
+      user: {
+        id: data.user.id,
+        username,
+        email,
+      },
     });
   } catch (error) {
-    console.error("Signup failed:", error.message);
+    console.log(error);
 
-    res.status(500).json({ error: "Unable to create account" });
+    res.status(500).json({
+      error: "Failed to create user",
+    });
   }
 });
 
